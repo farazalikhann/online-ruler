@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MeasureKit | Browser measurement tools</title>
+    <meta
+      name="description"
+      content="MeasureKit is a browser-first measurement suite. Calibrate your screen, then use accurate rulers and other tools directly on the page."
+    />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <main class="page shell">
+      <section class="surface hero">
+        <div class="hero-copy">
+          <p class="kicker">MeasureKit</p>
+          <h1>Measurement tools that live entirely in the browser.</h1>
+          <p>
+            Calibrate once against a real bank card, then every tool reads from the same screen scale.
+            No account, no backend, no drift between pages.
+          </p>
+          <div class="row">
+            <a class="button" href="./calibration.html">Start calibration</a>
+            <a class="button-ghost" href="./ruler.html">Open ruler</a>
+          </div>
+          <div class="row">
+            <span class="badge">Vite multi-page</span>
+            <span class="badge">Vanilla JS</span>
+            <span class="badge">Plain CSS</span>
+          </div>
+        </div>
+        <aside class="panel hero-card stack" id="home-status" aria-live="polite"></aside>
+      </section>
+    </main>
+    <script type="module" src="/src/pages/home-page.js"></script>
+  </body>
+</html>

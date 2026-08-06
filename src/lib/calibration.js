@@ -189,9 +189,7 @@ export function getCalibration() {
   const zoomFactor = numberOrFallback(environment.zoomFactor, 1);
   const effectivePxPerMm = stored.physicalPpi / (zoomFactor * 25.4);
   const calibrationZoomFactor = numberOrFallback(stored.environment?.zoomFactor, 1);
-  const stale = Math.abs(calibrationZoomFactor - zoomFactor) / calibrationZoomFactor > 0.01
-    || stored.environment?.screenWidth !== environment.screenWidth
-    || stored.environment?.screenHeight !== environment.screenHeight;
+  const stale = Math.abs(calibrationZoomFactor - zoomFactor) / calibrationZoomFactor > 0.01;
 
   return {
     ...stored,

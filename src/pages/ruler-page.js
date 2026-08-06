@@ -1,297 +1,469 @@
 import '../styles/global.css';
-import { getCalibration } from '../lib/calibration.js';
+import { getCalibration, watchCalibrationEnvironment } from '../lib/calibration.js';
 
 const app = document.getElementById('ruler-app');
-const calibration = getCalibration();
-const fallbackPxPerMm = 96 / 25.4;
 
 app.innerHTML = `
-  <section class="ruler-surface"></section>
-  <section class="ruler-overlay" data-orientation="horizontal" id="ruler-overlay">
-    <div class="ruler-hud ruler-hud--top">
-      <div class="panel space-between">
-        <div>
-          <p class="kicker">Ruler</p>
-          <h1>Full-screen measurement surface</h1>
-        </div>
-        <div class="row">
-          <button class="button" id="toggle-orientation" type="button">Horizontal</button>
-          <button class="button-ghost" id="toggle-units" type="button">Centimetres</button>
-        </div>
-      </div>
-      <div class="panel space-between">
-        <div class="stack small">
-          <span>Calibration</span>
-          <strong class="mono">${calibration ? `${calibration.physicalPpi.toFixed(2)} PPI` : 'Not calibrated'}</strong>
-        </div>
-        <div class="stack small" id="measurement-readout">
-          <span>Start / end</span>
-          <strong class="mono">0.0 cm</strong>
-        </div>
-      </div>
-      ${calibration ? '' : '<div class="callout callout--warn">This ruler is using an approximate CSS-pixel scale until you calibrate the screen.</div>'}
+  <section class="ruler-stage ruler-stage--horizontal" id="ruler-stage">
+    <canvas class="ruler-canvas" id="ruler-canvas" aria-hidden="true"></canvas>
+
+    <button class="ruler-marker ruler-marker--start" id="start-marker" type="button" aria-label="Move start marker">
+      <span class="ruler-marker__core"></span>
+    </button>
+
+    <button class="ruler-marker ruler-marker--end" id="end-marker" type="button" aria-label="Move end marker">
+      <span class="ruler-marker__core"></span>
+    </button>
+
+    <div class="ruler-pill" id="ruler-pill" aria-label="Ruler controls">
+      <button class="ruler-pill__button" id="orientation-toggle" type="button" aria-label="Toggle orientation">↔</button>
+      <button class="ruler-pill__button" id="unit-toggle" type="button" aria-label="Toggle units">cm</button>
+      <span class="ruler-pill__dot" id="calibration-dot" aria-hidden="true"></span>
+      <span class="ruler-pill__scale mono" id="scale-readout"></span>
+      <button class="ruler-pill__button" id="fullscreen-button" type="button" aria-label="Enter fullscreen">⛶</button>
     </div>
-    <div class="ruler-track" id="ruler-track"></div>
-    <div class="marker-line" id="start-marker" data-axis="horizontal"><div class="marker-handle" id="start-handle"></div></div>
-    <div class="marker-line" id="end-marker" data-axis="horizontal"><div class="marker-handle" id="end-handle"></div></div>
+
+    <div class="ruler-gate" id="calibration-gate" hidden>
+      <section class="ruler-gate__card">
+        <p class="ruler-gate__text" id="gate-copy">The ruler needs a calibration before it can show a real measurement.</p>
+        <a class="button" href="./calibration.html">Calibrate now</a>
+      </section>
+    </div>
   </section>
 `;
 
-const overlay = document.getElementById('ruler-overlay');
-const track = document.getElementById('ruler-track');
+const stage = document.getElementById('ruler-stage');
+const canvas = document.getElementById('ruler-canvas');
+const pill = document.getElementById('ruler-pill');
+const calibrationGate = document.getElementById('calibration-gate');
+const gateCopy = document.getElementById('gate-copy');
+const calibrationDot = document.getElementById('calibration-dot');
+const scaleReadout = document.getElementById('scale-readout');
+const orientationToggle = document.getElementById('orientation-toggle');
+const unitToggle = document.getElementById('unit-toggle');
+const fullscreenButton = document.getElementById('fullscreen-button');
 const startMarker = document.getElementById('start-marker');
 const endMarker = document.getElementById('end-marker');
-const readout = document.getElementById('measurement-readout');
-const toggleOrientation = document.getElementById('toggle-orientation');
-const toggleUnits = document.getElementById('toggle-units');
 
 const state = {
   orientation: 'horizontal',
   units: 'cm',
-  start: 120,
-  end: 340,
+  calibration: getCalibration(),
+  visible: true,
+  hideTimer: 0,
+  markers: {
+    start: 84,
+    end: 248
+  },
   dragging: null,
   pointers: new Map(),
-  pinch: null
+  pinch: null,
+  markerOffset: 0,
+  safeArea: {
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0
+  }
 };
 
-function currentPxPerMm() {
-  return calibration?.effectivePxPerMm ?? fallbackPxPerMm;
+let wakeLock = null;
+let resizeObserver = null;
+
+function readSafeAreaPx() {
+  const probe = document.createElement('div');
+  probe.style.position = 'absolute';
+  probe.style.visibility = 'hidden';
+  probe.style.pointerEvents = 'none';
+  probe.style.inset = '0';
+  probe.style.paddingTop = 'env(safe-area-inset-top)';
+  probe.style.paddingRight = 'env(safe-area-inset-right)';
+  probe.style.paddingBottom = 'env(safe-area-inset-bottom)';
+  probe.style.paddingLeft = 'env(safe-area-inset-left)';
+  document.body.appendChild(probe);
+  const styles = getComputedStyle(probe);
+  const safeArea = {
+    top: Number.parseFloat(styles.paddingTop) || 0,
+    right: Number.parseFloat(styles.paddingRight) || 0,
+    bottom: Number.parseFloat(styles.paddingBottom) || 0,
+    left: Number.parseFloat(styles.paddingLeft) || 0
+  };
+  probe.remove();
+  return safeArea;
 }
 
-function trackLength() {
-  return state.orientation === 'horizontal' ? track.clientWidth : track.clientHeight;
+function currentCalibration() {
+  state.calibration = getCalibration();
+  return state.calibration;
 }
 
-function clamp(value) {
-  return Math.max(0, Math.min(value, trackLength()));
+function pxPerMm() {
+  return state.calibration?.effectivePxPerMm ?? 0;
 }
 
-function axisValue(event) {
-  const rect = track.getBoundingClientRect();
+function isCalibrated() {
+  return Boolean(state.calibration && !state.calibration.stale);
+}
+
+function viewportSize() {
+  return {
+    width: stage.clientWidth,
+    height: stage.clientHeight
+  };
+}
+
+function rulerBandSize() {
+  const shortestSide = Math.min(window.innerWidth, window.innerHeight);
+  const base = shortestSide < 760 ? 60 : 90;
+  return Math.max(base, Math.round(Math.min(96, shortestSide * 0.12)));
+}
+
+function updateSafeArea() {
+  state.safeArea = readSafeAreaPx();
+  stage.style.setProperty('--ruler-safe-top', `${state.safeArea.top}px`);
+  stage.style.setProperty('--ruler-safe-right', `${state.safeArea.right}px`);
+  stage.style.setProperty('--ruler-safe-bottom', `${state.safeArea.bottom}px`);
+  stage.style.setProperty('--ruler-safe-left', `${state.safeArea.left}px`);
+}
+
+function setOrientation(orientation) {
+  state.orientation = orientation;
+  stage.dataset.orientation = orientation;
+  orientationToggle.textContent = orientation === 'horizontal' ? '↔' : '↕';
+  orientationToggle.setAttribute('aria-label', orientation === 'horizontal' ? 'Switch to vertical ruler' : 'Switch to horizontal ruler');
+  state.dragging = null;
+  state.pinch = null;
+  state.markers.start = 84;
+  state.markers.end = 248;
+  updateLayout();
+}
+
+function setUnits(units) {
+  state.units = units;
+  unitToggle.textContent = units;
+  unitToggle.setAttribute('aria-label', units === 'cm' ? 'Switch to inches' : 'Switch to centimetres');
+  updateScaleLabel();
+  renderCanvas();
+}
+
+function updateCalibrationGate() {
+  currentCalibration();
+  const calibrated = isCalibrated();
+  calibrationGate.hidden = calibrated;
+  if (!calibrated) {
+    gateCopy.textContent = state.calibration ? 'Browser zoom changed, so the stored calibration is no longer reliable.' : 'The ruler needs a calibration before it can show a real measurement.';
+  }
+  calibrationDot.dataset.state = calibrated ? 'ready' : state.calibration?.stale ? 'stale' : 'missing';
+}
+
+function updateScaleLabel() {
+  if (!isCalibrated()) {
+    scaleReadout.textContent = '';
+    return;
+  }
+
+  scaleReadout.textContent = `${pxPerMm().toFixed(2)} px/mm · ${measurementText()}`;
+}
+
+function clampMarker(value) {
+  const size = state.orientation === 'horizontal' ? viewportSize().width : viewportSize().height;
+  const band = rulerBandSize();
+  return Math.max(0, Math.min(value, size - 1));
+}
+
+function markerAxisValue(event) {
+  const rect = stage.getBoundingClientRect();
   return state.orientation === 'horizontal'
-    ? event.clientX - rect.left
-    : event.clientY - rect.top;
+    ? event.clientX - rect.left - state.safeArea.left
+    : event.clientY - rect.top - state.safeArea.top;
 }
 
-function pointerDistance() {
-  const [first, second] = Array.from(state.pointers.values());
-  if (typeof first !== 'number' || typeof second !== 'number') {
-    return 0;
-  }
-
-  return Math.abs(second - first);
+function markerSpanPx() {
+  return Math.abs(state.markers.end - state.markers.start);
 }
 
-function pointerMidpoint() {
-  const [first, second] = Array.from(state.pointers.values());
-  if (typeof first !== 'number' || typeof second !== 'number') {
-    return 0;
-  }
-
-  return (first + second) / 2;
+function markerMidpointPx() {
+  return (state.markers.start + state.markers.end) / 2;
 }
 
-function setMarkerPositions() {
-  const start = clamp(state.start);
-  const end = clamp(state.end);
+function positionMarkers() {
+  const band = rulerBandSize();
+  const start = clampMarker(state.markers.start);
+  const end = clampMarker(state.markers.end);
   const [first, second] = start <= end ? [start, end] : [end, start];
-  state.start = first;
-  state.end = second;
+  state.markers.start = first;
+  state.markers.end = second;
 
   if (state.orientation === 'horizontal') {
-    startMarker.style.left = `${first}px`;
-    startMarker.style.top = '0';
-    startMarker.style.height = '100%';
-    startMarker.style.width = '2px';
-    endMarker.style.left = `${second}px`;
-    endMarker.style.top = '0';
-    endMarker.style.height = '100%';
-    endMarker.style.width = '2px';
-    startMarker.dataset.axis = 'horizontal';
-    endMarker.dataset.axis = 'horizontal';
-    startMarker.querySelector('.marker-handle').style.left = '1px';
-    startMarker.querySelector('.marker-handle').style.top = '12px';
-    endMarker.querySelector('.marker-handle').style.left = '1px';
-    endMarker.querySelector('.marker-handle').style.top = '12px';
+    startMarker.style.left = `${state.safeArea.left + first - 22}px`;
+    startMarker.style.top = `${Math.max(state.safeArea.top, 0)}px`;
+    startMarker.style.width = '44px';
+    startMarker.style.height = `${band}px`;
+    endMarker.style.left = `${state.safeArea.left + second - 22}px`;
+    endMarker.style.top = `${Math.max(state.safeArea.top, 0)}px`;
+    endMarker.style.width = '44px';
+    endMarker.style.height = `${band}px`;
+    startMarker.dataset.orientation = 'horizontal';
+    endMarker.dataset.orientation = 'horizontal';
     return;
   }
 
-  startMarker.style.top = `${first}px`;
-  startMarker.style.left = '0';
-  startMarker.style.width = '100%';
-  startMarker.style.height = '2px';
-  endMarker.style.top = `${second}px`;
-  endMarker.style.left = '0';
-  endMarker.style.width = '100%';
-  endMarker.style.height = '2px';
-  startMarker.dataset.axis = 'vertical';
-  endMarker.dataset.axis = 'vertical';
-  startMarker.querySelector('.marker-handle').style.left = '12px';
-  startMarker.querySelector('.marker-handle').style.top = '1px';
-  endMarker.querySelector('.marker-handle').style.left = '12px';
-  endMarker.querySelector('.marker-handle').style.top = '1px';
+  startMarker.style.left = `${Math.max(state.safeArea.left, 0)}px`;
+  startMarker.style.top = `${state.safeArea.top + first - 22}px`;
+  startMarker.style.width = `${band}px`;
+  startMarker.style.height = '44px';
+  endMarker.style.left = `${Math.max(state.safeArea.left, 0)}px`;
+  endMarker.style.top = `${state.safeArea.top + second - 22}px`;
+  endMarker.style.width = `${band}px`;
+  endMarker.style.height = '44px';
+  startMarker.dataset.orientation = 'vertical';
+  endMarker.dataset.orientation = 'vertical';
 }
 
-function formatMeasurement() {
-  const deltaPx = Math.abs(state.end - state.start);
-  const mm = deltaPx / currentPxPerMm();
+function measurementText() {
+  if (!isCalibrated()) {
+    return '';
+  }
 
+  const mm = markerSpanPx() / pxPerMm();
   if (state.units === 'in') {
-    const inches = mm / 25.4;
-    readout.innerHTML = `<span>Start / end</span><strong class="mono">${inches.toFixed(3)} in</strong>`;
+    return `${(mm / 25.4).toFixed(3)} in`;
+  }
+
+  return `${(mm / 10).toFixed(2)} cm`;
+}
+
+function updateMarkerStyles() {
+  const band = rulerBandSize();
+  stage.style.setProperty('--ruler-band-size', `${band}px`);
+  startMarker.style.setProperty('--marker-band', `${band}px`);
+  endMarker.style.setProperty('--marker-band', `${band}px`);
+  positionMarkers();
+}
+
+function updateLayout() {
+  updateSafeArea();
+  updateCalibrationGate();
+  updateScaleLabel();
+  updateMarkerStyles();
+  renderCanvas();
+  renderMeasurement();
+}
+
+function renderMeasurement() {
+  if (isCalibrated()) {
+    scaleReadout.textContent = `${pxPerMm().toFixed(2)} px/mm`;
+  }
+}
+
+function snapToDevicePixel(value, dpr) {
+  return Math.round(value * dpr) / dpr;
+}
+
+function drawTick(ctx, isHorizontal, origin, tickLength, dpr) {
+  const snapped = snapToDevicePixel(origin, dpr);
+  const lineWidth = 1 / dpr;
+  ctx.lineWidth = lineWidth;
+  ctx.beginPath();
+  if (isHorizontal) {
+    ctx.moveTo(snapped, 0);
+    ctx.lineTo(snapped, tickLength);
+  } else {
+    ctx.moveTo(0, snapped);
+    ctx.lineTo(tickLength, snapped);
+  }
+  ctx.stroke();
+}
+
+function renderCanvas() {
+  const calibration = currentCalibration();
+  if (!calibration || calibration.stale) {
+    canvas.width = 1;
+    canvas.height = 1;
+    canvas.style.width = '1px';
+    canvas.style.height = '1px';
+    const context = canvas.getContext('2d');
+    context.clearRect(0, 0, 1, 1);
     return;
   }
 
-  readout.innerHTML = `<span>Start / end</span><strong class="mono">${(mm / 10).toFixed(2)} cm</strong>`;
-}
+  const dpr = window.devicePixelRatio || 1;
+  const { width, height } = viewportSize();
+  const band = rulerBandSize();
+  const safeTop = Math.round(state.safeArea.top);
+  const safeLeft = Math.round(state.safeArea.left);
+  const safeRight = Math.round(state.safeArea.right);
+  const safeBottom = Math.round(state.safeArea.bottom);
 
-function renderRuler() {
-  const canvas = document.createElement('canvas');
-  const isHorizontal = state.orientation === 'horizontal';
-  const width = isHorizontal ? track.clientWidth : track.clientHeight;
-  const height = isHorizontal ? track.clientHeight : track.clientWidth;
-  const devicePixelRatio = window.devicePixelRatio || 1;
-  const cssPxPerMm = currentPxPerMm();
-
-  canvas.width = Math.max(1, Math.round(width * devicePixelRatio));
-  canvas.height = Math.max(1, Math.round(height * devicePixelRatio));
+  canvas.width = Math.max(1, Math.round(width * dpr));
+  canvas.height = Math.max(1, Math.round(height * dpr));
   canvas.style.width = `${width}px`;
   canvas.style.height = `${height}px`;
 
   const ctx = canvas.getContext('2d');
-  ctx.scale(devicePixelRatio, devicePixelRatio);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = '#151515';
   ctx.fillRect(0, 0, width, height);
 
-  const limit = isHorizontal ? width : height;
+  const pxMm = pxPerMm();
+  const isHorizontal = state.orientation === 'horizontal';
+  const axisLength = isHorizontal ? width - safeLeft - safeRight : height - safeTop - safeBottom;
+  const bandStart = isHorizontal ? safeTop : safeLeft;
+  const bandThickness = band;
+  const labelMargin = Math.max(10, Math.round(bandThickness * 0.14));
   const majorEvery = state.units === 'cm' ? 10 : 25.4;
-  const halfEvery = state.units === 'cm' ? 5 : 12.7;
+  const mediumEvery = state.units === 'cm' ? 5 : 12.7;
+  const minorEvery = state.units === 'cm' ? 1 : 1.5875;
   const quarterEvery = state.units === 'in' ? 6.35 : null;
   const eighthEvery = state.units === 'in' ? 3.175 : null;
-  const minorStep = state.units === 'cm' ? 1 : 1.5875;
+  const sixteenthEvery = state.units === 'in' ? 1.5875 : null;
 
-  for (let mm = 0; mm <= limit / cssPxPerMm + minorStep; mm += minorStep) {
-    const pos = mm * cssPxPerMm;
-    const isMajor = Math.abs(mm % majorEvery) < minorStep / 2;
-    const isHalf = !isMajor && Math.abs(mm % halfEvery) < minorStep / 2;
-    const isQuarter = !isMajor && !isHalf && quarterEvery && Math.abs(mm % quarterEvery) < minorStep / 2;
-    const isEighth = !isMajor && !isHalf && !isQuarter && eighthEvery && Math.abs(mm % eighthEvery) < minorStep / 2;
-    const tickLength = isMajor ? 52 : isHalf ? 40 : isQuarter ? 32 : isEighth ? 24 : 18;
+  ctx.fillStyle = '#151515';
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = 'rgba(228, 177, 94, 0.06)';
+  ctx.fillRect(0, bandStart, isHorizontal ? width : bandThickness, isHorizontal ? bandThickness : height);
 
-    ctx.strokeStyle = 'rgba(228, 177, 94, 0.92)';
-    ctx.lineWidth = isMajor ? 2 : 1;
-    ctx.beginPath();
-    if (isHorizontal) {
-      ctx.moveTo(pos + 0.5, 0);
-      ctx.lineTo(pos + 0.5, tickLength);
-    } else {
-      ctx.moveTo(0, pos + 0.5);
-      ctx.lineTo(tickLength, pos + 0.5);
-    }
-    ctx.stroke();
+  for (let mm = 0; mm <= axisLength / pxMm + minorEvery; mm += minorEvery) {
+    const logicalPx = mm * pxMm;
+    const originPx = (isHorizontal ? safeLeft : safeTop) + logicalPx;
+    const isMajor = Math.abs(mm % majorEvery) < minorEvery / 2;
+    const isMedium = !isMajor && Math.abs(mm % mediumEvery) < minorEvery / 2;
+    const isQuarter = !isMajor && !isMedium && quarterEvery && Math.abs(mm % quarterEvery) < minorEvery / 2;
+    const isEighth = !isMajor && !isMedium && !isQuarter && eighthEvery && Math.abs(mm % eighthEvery) < minorEvery / 2;
+    const isSixteenth = !isMajor && !isMedium && !isQuarter && !isEighth && sixteenthEvery && Math.abs(mm % sixteenthEvery) < minorEvery / 2;
+    const tickLength = isMajor
+      ? bandThickness - labelMargin * 0.55
+      : isMedium
+        ? bandThickness * 0.7
+        : isQuarter
+          ? bandThickness * 0.5
+          : isEighth
+            ? bandThickness * 0.38
+            : isSixteenth
+              ? bandThickness * 0.28
+              : bandThickness * 0.2;
+
+    ctx.strokeStyle = 'rgba(228, 177, 94, 0.94)';
+    drawTick(ctx, isHorizontal, originPx, tickLength, dpr);
 
     if (isMajor) {
+      ctx.save();
       ctx.fillStyle = '#f3e1bb';
-      ctx.font = '14px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
-      ctx.textBaseline = 'top';
+      ctx.font = `${Math.max(12, Math.round(bandThickness * 0.16))}px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
       const label = state.units === 'cm' ? String(Math.round(mm / 10)) : String(Math.round(mm / 25.4));
+
       if (isHorizontal) {
-        ctx.fillText(label, pos + 4, tickLength + 4);
+        const labelX = snapToDevicePixel(originPx, dpr);
+        const labelY = Math.max(bandStart + bandThickness - labelMargin, bandStart + tickLength + 10);
+        ctx.fillText(label, labelX, labelY);
       } else {
-        ctx.fillText(label, tickLength + 6, pos + 2);
+        const labelX = Math.max(safeLeft + bandThickness - labelMargin, safeLeft + tickLength + 10);
+        const labelY = snapToDevicePixel(originPx, dpr);
+        ctx.translate(labelX, labelY);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText(label, 0, 0);
       }
+      ctx.restore();
     }
   }
 
+  const edgeStroke = 'rgba(242, 201, 129, 0.3)';
+  ctx.strokeStyle = edgeStroke;
+  ctx.lineWidth = 1 / dpr;
+  ctx.beginPath();
   if (isHorizontal) {
-    ctx.strokeStyle = 'rgba(242, 201, 129, 0.3)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, 52.5);
-    ctx.lineTo(width, 52.5);
-    ctx.stroke();
+    ctx.moveTo(0, bandStart + bandThickness + 0.5);
+    ctx.lineTo(width, bandStart + bandThickness + 0.5);
   } else {
-    ctx.strokeStyle = 'rgba(242, 201, 129, 0.3)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(52.5, 0);
-    ctx.lineTo(52.5, height);
-    ctx.stroke();
+    ctx.moveTo(bandStart + bandThickness + 0.5, 0);
+    ctx.lineTo(bandStart + bandThickness + 0.5, height);
+  }
+  ctx.stroke();
+
+  renderMeasurement();
+}
+
+function showControls() {
+  pill.classList.remove('ruler-pill--hidden');
+  state.visible = true;
+  window.clearTimeout(state.hideTimer);
+  state.hideTimer = window.setTimeout(() => {
+    pill.classList.add('ruler-pill--hidden');
+    state.visible = false;
+  }, 3000);
+}
+
+async function requestFullscreen() {
+  if (document.fullscreenElement) {
+    return;
   }
 
-  track.replaceChildren(canvas);
+  if (!stage.requestFullscreen) {
+    return;
+  }
+
+  try {
+    await stage.requestFullscreen({ navigationUI: 'hide' });
+  } catch {
+    // Browser can reject fullscreen on mobile or sandboxed views.
+  }
 }
 
-function updateUI() {
-  overlay.dataset.orientation = state.orientation;
-  toggleOrientation.textContent = state.orientation === 'horizontal' ? 'Horizontal' : 'Vertical';
-  toggleUnits.textContent = state.units === 'cm' ? 'Centimetres' : 'Inches';
-  startMarker.style.display = 'block';
-  endMarker.style.display = 'block';
-  renderRuler();
-  setMarkerPositions();
-  formatMeasurement();
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator) || document.visibilityState !== 'visible') {
+    return;
+  }
+
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => {
+      wakeLock = null;
+    }, { once: true });
+  } catch {
+    wakeLock = null;
+  }
 }
 
-function beginPointer(kind, event) {
-  const value = clamp(axisValue(event));
-  state.pointers.set(event.pointerId, value);
+function releaseWakeLock() {
+  if (wakeLock) {
+    wakeLock.release().catch(() => {});
+    wakeLock = null;
+  }
+}
+
+function enableMeasurementMode() {
+  showControls();
+  requestWakeLock();
+}
+
+function setDragging(kind, pointerId, value) {
   state.dragging = kind;
-  event.currentTarget.setPointerCapture?.(event.pointerId);
-
-  if (kind === 'start' || kind === 'end') {
-    state[kind] = value;
-    setMarkerPositions();
-    formatMeasurement();
-  }
+  state.pointers.set(pointerId, value);
 }
 
-function beginTrackPointer(event) {
-  const value = clamp(axisValue(event));
-  const nearest = Math.abs(value - state.start) < Math.abs(value - state.end) ? 'start' : 'end';
-  state.pointers.set(event.pointerId, value);
-  state.dragging = nearest;
-  state[nearest] = value;
-  event.currentTarget.setPointerCapture?.(event.pointerId);
-  setMarkerPositions();
-  formatMeasurement();
-}
-
-function applyPinch() {
-  if (!state.pinch || state.pointers.size < 2) {
-    return;
-  }
-
-  const midpoint = clamp(pointerMidpoint());
-  const distance = pointerDistance();
-  const ratio = distance / Math.max(1, state.pinch.distance);
-  const nextSpan = Math.max(24, state.pinch.span * ratio);
-
-  state.start = clamp(midpoint - nextSpan / 2);
-  state.end = clamp(midpoint + nextSpan / 2);
-  state.dragging = null;
-  setMarkerPositions();
-  formatMeasurement();
-}
-
-function handlePointerMove(event) {
-  if (!state.pointers.has(event.pointerId)) {
-    return;
-  }
-
-  state.pointers.set(event.pointerId, clamp(axisValue(event)));
-
+function updateDragPosition(pointerId, value) {
+  state.pointers.set(pointerId, value);
   if (state.pointers.size >= 2) {
     if (!state.pinch) {
       state.pinch = {
-        distance: Math.max(1, pointerDistance()),
-        span: Math.max(24, Math.abs(state.end - state.start))
+        distance: Math.max(1, markerDistanceFromPointers()),
+        span: Math.max(32, markerSpanPx())
       };
     }
 
-    applyPinch();
+    const pointerValues = Array.from(state.pointers.values());
+    const midpoint = (pointerValues[0] + pointerValues[1]) / 2;
+    const distance = Math.abs(pointerValues[1] - pointerValues[0]);
+    const ratio = distance / Math.max(1, state.pinch.distance);
+    const span = Math.max(24, state.pinch.span * ratio);
+    state.markers.start = clampMarker(midpoint - span / 2);
+    state.markers.end = clampMarker(midpoint + span / 2);
+    state.dragging = null;
+    positionMarkers();
+    renderCanvas();
     return;
   }
 
@@ -299,59 +471,153 @@ function handlePointerMove(event) {
     return;
   }
 
-  const nextValue = clamp(axisValue(event));
-  state[state.dragging] = nextValue;
-  setMarkerPositions();
-  formatMeasurement();
+  state.markers[state.dragging] = value;
+  positionMarkers();
+  renderCanvas();
+}
+
+function markerDistanceFromPointers() {
+  const pointerValues = Array.from(state.pointers.values());
+  if (pointerValues.length < 2) {
+    return 0;
+  }
+
+  return Math.abs(pointerValues[1] - pointerValues[0]);
+}
+
+function handlePointerDown(kind, event) {
+  enableMeasurementMode();
+  if (state.calibration && state.calibration.stale) {
+    updateCalibrationGate();
+    return;
+  }
+
+  const value = clampMarker(markerAxisValue(event));
+  setDragging(kind, event.pointerId, value);
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+  if (kind === 'start' || kind === 'end') {
+    state.markers[kind] = value;
+    positionMarkers();
+    renderCanvas();
+  }
+}
+
+function handleTrackPointerDown(event) {
+  enableMeasurementMode();
+  if (!isCalibrated()) {
+    return;
+  }
+
+  const value = clampMarker(markerAxisValue(event));
+  const nearest = Math.abs(value - state.markers.start) < Math.abs(value - state.markers.end) ? 'start' : 'end';
+  setDragging(nearest, event.pointerId, value);
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+  state.markers[nearest] = value;
+  positionMarkers();
+  renderCanvas();
+}
+
+function handlePointerMove(event) {
+  if (!state.pointers.has(event.pointerId)) {
+    return;
+  }
+
+  const value = clampMarker(markerAxisValue(event));
+  updateDragPosition(event.pointerId, value);
 }
 
 function handlePointerUp(event) {
   state.pointers.delete(event.pointerId);
+  state.dragging = state.pointers.size ? state.dragging : null;
   if (state.pointers.size < 2) {
     state.pinch = null;
   }
-  if (state.pointers.size === 0) {
-    state.dragging = null;
-  }
 }
 
+function updateInteractionVisibility() {
+  showControls();
+}
+
+function verifyAndRefresh() {
+  updateCalibrationGate();
+  if (!isCalibrated()) {
+    canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+
+  updateScaleLabel();
+  renderCanvas();
+  positionMarkers();
+}
+
+orientationToggle.addEventListener('click', () => {
+  setOrientation(state.orientation === 'horizontal' ? 'vertical' : 'horizontal');
+  enableMeasurementMode();
+});
+
+unitToggle.addEventListener('click', () => {
+  setUnits(state.units === 'cm' ? 'in' : 'cm');
+  enableMeasurementMode();
+});
+
+fullscreenButton.addEventListener('click', async () => {
+  await requestFullscreen();
+  await requestWakeLock();
+  enableMeasurementMode();
+});
+
 startMarker.addEventListener('pointerdown', (event) => {
-  event.stopPropagation();
-  beginPointer('start', event);
+  event.preventDefault();
+  handlePointerDown('start', event);
 });
 
 endMarker.addEventListener('pointerdown', (event) => {
-  event.stopPropagation();
-  beginPointer('end', event);
+  event.preventDefault();
+  handlePointerDown('end', event);
 });
 
-track.addEventListener('pointerdown', beginTrackPointer);
+stage.addEventListener('pointerdown', (event) => {
+  if (event.target === stage || event.target === canvas) {
+    requestFullscreen();
+  }
+  updateInteractionVisibility();
+});
+
+stage.addEventListener('pointermove', updateInteractionVisibility);
+stage.addEventListener('touchstart', updateInteractionVisibility, { passive: true });
+stage.addEventListener('mousemove', updateInteractionVisibility);
 window.addEventListener('pointermove', handlePointerMove);
 window.addEventListener('pointerup', handlePointerUp);
 window.addEventListener('pointercancel', handlePointerUp);
-
-toggleOrientation.addEventListener('click', () => {
-  state.orientation = state.orientation === 'horizontal' ? 'vertical' : 'horizontal';
-  state.start = 120;
-  state.end = 340;
-  updateUI();
+window.addEventListener('resize', verifyAndRefresh);
+window.addEventListener('orientationchange', verifyAndRefresh);
+window.visualViewport?.addEventListener('resize', verifyAndRefresh);
+window.visualViewport?.addEventListener('scroll', verifyAndRefresh);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') {
+    releaseWakeLock();
+  } else {
+    requestWakeLock();
+    verifyAndRefresh();
+  }
 });
-
-toggleUnits.addEventListener('click', () => {
-  state.units = state.units === 'cm' ? 'in' : 'cm';
-  updateUI();
-});
-
-track.style.touchAction = 'none';
 
 if ('ResizeObserver' in window) {
-  const resizeObserver = new ResizeObserver(() => {
-    updateUI();
+  resizeObserver = new ResizeObserver(() => {
+    verifyAndRefresh();
   });
-
-  resizeObserver.observe(track);
-} else {
-  window.addEventListener('resize', updateUI);
+  resizeObserver.observe(stage);
 }
 
-updateUI();
+stage.dataset.orientation = state.orientation;
+stage.style.overscrollBehavior = 'none';
+stage.style.touchAction = 'none';
+pill.style.setProperty('visibility', 'visible');
+updateSafeArea();
+showControls();
+verifyAndRefresh();
+
+watchCalibrationEnvironment((calibration) => {
+  state.calibration = calibration;
+  verifyAndRefresh();
+});
